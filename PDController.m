@@ -204,11 +204,11 @@ classdef PDController < handle
                 phi, theta, psi, p, q, r, phi_r, theta_r, psi_r)
             % Inner-Loop Attitude Control with Feedback Linearization
             % (Equations 11-12)
-            
+
             % Euler rates from angular velocities
             sp = sin(phi); cp = cos(phi);
             st = sin(theta); ct = cos(theta);
-            
+
             % Avoid gimbal lock - use approximation near singularity
             if abs(ct) < 0.1
                 % Near gimbal lock, use simplified approximation
@@ -224,51 +224,138 @@ classdef PDController < handle
                 theta_dot = eta_dot(2);
                 psi_dot = eta_dot(3);
             end
-            
+
             % --- Roll Control ---
             % Angular error (Eq. 12a)
             e_dot_phi = obj.kP1_phi_theta * (phi_r - phi) - phi_dot;
-            
+
             % Derivative of angular error
             de_dot_phi = (e_dot_phi - obj.e_dot_phi_prev) / obj.dt;
             obj.e_dot_phi_prev = e_dot_phi;
-            
+
             % Virtual control (Eq. 12d)
             v_phi = obj.kP2_phi_theta * e_dot_phi + obj.kD_phi_theta * de_dot_phi;
-            
+
             % --- Pitch Control ---
             % Angular error (Eq. 12b)
             e_dot_theta = obj.kP1_phi_theta * (theta_r - theta) - theta_dot;
-            
+
             % Derivative of angular error
             de_dot_theta = (e_dot_theta - obj.e_dot_theta_prev) / obj.dt;
             obj.e_dot_theta_prev = e_dot_theta;
-            
+
             % Virtual control (Eq. 12e)
             v_theta = obj.kP2_phi_theta * e_dot_theta + obj.kD_phi_theta * de_dot_theta;
-            
+
             % --- Yaw Control ---
             % Angular error (Eq. 12c)
             e_dot_psi = obj.kP1_psi * (psi_r - psi) - psi_dot;
-            
+
             % Virtual control (Eq. 12f) - P only, no derivative term
             v_psi = obj.kP2_psi * e_dot_psi;
-            
-            % --- Simplified torque computation ---
-            % Use inertia directly without full Euler-Lagrange terms
-            Mp = obj.Ixx * v_phi;
-            Mq = obj.Iyy * v_theta;
-            Mr = obj.Izz * v_psi;
-            
+
+            % --- FEEDBACK LINEARIZATION (Equation 11) ---
+            % Compute B and C matrices for Euler-Lagrange formulation
+            [B, C] = obj.computeBCmatrices(phi, theta, psi, phi_dot, theta_dot, psi_dot);
+
+            % Virtual control vector
+            v = [v_phi; v_theta; v_psi];
+
+            % Euler rate vector
+            eta_dot_vec = [phi_dot; theta_dot; psi_dot];
+
+            % Compute W^(-T) (transpose of inverse of W)
+            % W relates Euler rates to angular velocities: omega = W^(-1) * eta_dot
+            % So W^(-T) = (W^(-1))^T = (W^T)^(-1)
+            if abs(ct) < 0.1
+                % Near singularity, use simplified approach
+                W_inv_T = eye(3);
+            else
+                W_inv = [1,  sp*st/ct,  cp*st/ct;
+                         0,  cp,       -sp;
+                         0,  sp/ct,     cp/ct];
+                W_inv_T = W_inv';
+            end
+
+            % Apply feedback linearization (Eq. 11): M' = W^(-T) * [B*v + C*eta_dot]
+            M_prime = W_inv_T * (B * v + C * eta_dot_vec);
+
+            % Extract individual torques
+            Mp = M_prime(1);
+            Mq = M_prime(2);
+            Mr = M_prime(3);
+
             % Convert torques to normalized control inputs
             tau_R = -Mp / (4 * obj.Tmax * obj.l * sqrt(2) / 2);
             tau_P = -Mq / (4 * obj.Tmax * obj.l * sqrt(2) / 2);
             tau_Y = Mr / (4 * obj.Tmax * obj.cD_cL);
-            
+
             % Saturate control inputs
             tau_R = max(-1, min(1, tau_R));
             tau_P = max(-1, min(1, tau_P));
             tau_Y = max(-1, min(1, tau_Y));
+        end
+
+        function [B, C] = computeBCmatrices(obj, phi, theta, psi, phi_dot, theta_dot, psi_dot)
+            % Compute B and C matrices for Euler-Lagrange formulation
+            % Based on reference [19]: Martini et al., ICUAS 2022
+            %
+            % B: Inertia matrix in Euler angle coordinates (3x3)
+            % C: Coriolis/centrifugal matrix in Euler angle coordinates (3x3)
+
+            sp = sin(phi); cp = cos(phi);
+            st = sin(theta); ct = cos(theta);
+
+            % Avoid division by zero
+            if abs(ct) < 0.01
+                ct = 0.01 * sign(ct);
+            end
+
+            % B Matrix (Inertia transformation from Euler to body frame)
+            % This transforms the inertia effects from Euler coordinate space
+            % Derived from: I_eta = W^T * I_body * W
+            % where W is the matrix relating omega_B to eta_dot
+
+            % For a quadrotor with diagonal inertia I = diag(Ixx, Iyy, Izz)
+            % The B matrix accounts for the rotational transformation
+
+            B = zeros(3, 3);
+            B(1,1) = obj.Ixx;
+            B(1,2) = 0;
+            B(1,3) = -obj.Ixx * st;
+
+            B(2,1) = 0;
+            B(2,2) = obj.Iyy * cp^2 + obj.Izz * sp^2;
+            B(2,3) = (obj.Iyy - obj.Izz) * cp * sp * ct;
+
+            B(3,1) = -obj.Ixx * st;
+            B(3,2) = (obj.Iyy - obj.Izz) * cp * sp * ct;
+            B(3,3) = obj.Ixx * st^2 + obj.Iyy * sp^2 * ct^2 + obj.Izz * cp^2 * ct^2;
+
+            % C Matrix (Coriolis and centrifugal effects)
+            % Contains velocity-dependent terms
+            % Derived from Christoffel symbols of the Lagrangian
+
+            C = zeros(3, 3);
+            C(1,1) = 0;
+            C(1,2) = (obj.Iyy - obj.Izz) * (theta_dot * cp * sp - psi_dot * sp^2 * ct) ...
+                     + (obj.Izz - obj.Iyy) * psi_dot * cp^2 * ct - obj.Ixx * psi_dot * ct;
+            C(1,3) = (obj.Izz - obj.Iyy) * psi_dot * cp * sp * ct^2;
+
+            C(2,1) = (obj.Izz - obj.Iyy) * (theta_dot * cp * sp - psi_dot * sp^2 * ct) ...
+                     + (obj.Iyy - obj.Izz) * psi_dot * cp^2 * ct + obj.Ixx * psi_dot * ct;
+            C(2,2) = (obj.Izz - obj.Iyy) * phi_dot * cp * sp;
+            C(2,3) = -obj.Ixx * psi_dot * st * ct + obj.Iyy * psi_dot * sp^2 * st * ct ...
+                     + obj.Izz * psi_dot * cp^2 * st * ct;
+
+            C(3,1) = (obj.Iyy - obj.Izz) * psi_dot * ct^2 * sp * cp - obj.Ixx * theta_dot * ct;
+            C(3,2) = (obj.Izz - obj.Iyy) * (theta_dot * cp * sp * st + phi_dot * sp^2 * ct) ...
+                     + (obj.Iyy - obj.Izz) * phi_dot * cp^2 * ct ...
+                     + obj.Ixx * psi_dot * st * ct - obj.Iyy * psi_dot * sp^2 * st * ct ...
+                     - obj.Izz * psi_dot * cp^2 * st * ct;
+            C(3,3) = (obj.Iyy - obj.Izz) * phi_dot * cp * sp * ct^2 ...
+                     - obj.Iyy * theta_dot * sp^2 * ct * st ...
+                     - obj.Izz * theta_dot * cp^2 * ct * st + obj.Ixx * theta_dot * ct * st;
         end
         
         function resetController(obj)
